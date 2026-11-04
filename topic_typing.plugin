@@ -1,0 +1,379 @@
+__id__ = "topic_typing"
+__name__ = "Topic Typing"
+__description__ = "In forum groups every topic shows its own typing indicator, in the topic tabs, the topic list and the topic itself, even when people type in several topics at once."
+__author__ = "Justice"
+__version__ = "1.0.0"
+
+# Why stock only shows typing in one topic per group:
+#   MessagesController.updatePrintingStrings walks every group and, inside the
+#   loop over that group's topics, puts a NEW empty map for the group on every
+#   pass. So when people type in two or more topics of one group at the same
+#   time, every topic but the last one loses its "typing" text. Nagram fixed it
+#   upstream (NextAlone/Nagram pull 209); Nagram XF 12.10.1 does not have it.
+#
+# This plugin, for groups only:
+#   1. after each stock run, rebuilds the typing text of every topic of any group
+#      where people type in two or more topics, with the same wording, emoji and
+#      filters as stock (blocked users stay hidden when that option is on);
+#   2. posts the result right after stock's own result on the UI thread and asks
+#      for a redraw, so the topic header and the topic list read the right text;
+#   3. draws the typing dots on every topic tab (top tabs and side tabs) whose
+#      topic has someone typing. Stock tabs show no typing at all.
+# Private chats and groups with typing in one topic are left exactly as stock.
+# Logcat tag: TopicTyping.
+
+import threading
+
+from java import jclass, jint, jarray
+from base_plugin import BasePlugin, MethodHook
+from hook_utils import find_class, get_private_field
+from android_utils import run_on_ui_thread, dp
+from ui.settings import Header, Switch, Divider
+
+LOG_TAG = "TopicTyping"
+
+JLong = jclass("java.lang.Long")
+JInteger = jclass("java.lang.Integer")
+JObject = jclass("java.lang.Object")
+JString = jclass("java.lang.String")
+LongSparseArray = jclass("androidx.collection.LongSparseArray")
+LocaleController = jclass("org.telegram.messenger.LocaleController")
+AndroidUtilities = jclass("org.telegram.messenger.AndroidUtilities")
+RString = jclass("org.telegram.messenger.R$string")
+Theme = jclass("org.telegram.ui.ActionBar.Theme")
+Gravity = jclass("android.view.Gravity")
+View = jclass("android.view.View")
+FrameLayoutParams = jclass("android.widget.FrameLayout$LayoutParams")
+WeakHashMap = jclass("java.util.WeakHashMap")
+Collections = jclass("java.util.Collections")
+
+# Same order as the stock instanceof chain: (TL class, string key, type).
+_ACTIONS = [
+    ("TL_sendMessageRecordAudioAction", "IsRecordingAudio", 1),
+    ("TL_sendMessageRecordRoundAction", "IsRecordingRound", 4),
+    ("TL_sendMessageUploadRoundAction", "IsSendingVideo", 4),
+    ("TL_sendMessageUploadAudioAction", "IsSendingAudio", 2),
+    ("TL_sendMessageUploadVideoAction", "IsSendingVideo", 2),
+    ("TL_sendMessageRecordVideoAction", "IsRecordingVideo", 2),
+    ("TL_sendMessageUploadDocumentAction", "IsSendingFile", 2),
+    ("TL_sendMessageUploadPhotoAction", "IsSendingPhoto", 2),
+    ("TL_sendMessageGamePlayAction", "IsSendingGame", 3),
+    ("TL_sendMessageGeoLocationAction", "IsSelectingLocation", 0),
+    ("TL_sendMessageChooseContactAction", "IsSelectingContact", 0),
+    ("TL_sendMessageEmojiInteractionSeen", "IsEnjoyngAnimations", 5),
+    ("TL_sendMessageChooseStickerAction", "IsChoosingSticker", 5),
+]
+
+
+def _log(msg):
+    try:
+        jclass("android.util.Log").i(LOG_TAG, str(msg))
+    except Exception:
+        pass
+
+
+def _res(key):
+    return int(getattr(RString, key))
+
+
+class TopicTypingPlugin(BasePlugin):
+
+    def create_settings(self):
+        return [
+            Header(text="Topic Typing"),
+            Switch(key="tabs_dots", text="Typing dots on topic tabs", default=True,
+                   subtext="Shows animated dots on a topic tab while someone types in that topic."),
+            Divider(text="The topic header and the topic list always show typing per topic."),
+        ]
+
+    def on_plugin_load(self):
+        self.lock = threading.Lock()
+        self.tabs = Collections.synchronizedMap(WeakHashMap())   # tab view -> "account:dialog:topic"
+        self.dots = {}                                            # tab view hash -> dots view
+        self.live = {}                                            # account -> {dialog: topics typing now}
+        self.action_classes = []
+        for name, key, typ in _ACTIONS:
+            try:
+                self.action_classes.append((jclass("org.telegram.tgnet.TLRPC$" + name), key, typ))
+            except Exception as e:
+                _log("no class %s: %s" % (name, e))
+
+        mc_cls = find_class("org.telegram.messenger.MessagesController")
+        plugin = self
+
+        class PrintingHook(MethodHook):
+            def after_hooked_method(self, param):
+                try:
+                    plugin._after_printing(param.thisObject)
+                except Exception as e:
+                    _log("after printing: %s" % e)
+
+        self.hook_method(mc_cls.getDeclaredMethod("updatePrintingStrings"), PrintingHook())
+
+        class TabSetHook(MethodHook):
+            def after_hooked_method(self, param):
+                try:
+                    plugin._after_tab_set(param)
+                except Exception as e:
+                    _log("tab set: %s" % e)
+
+        class TabClearHook(MethodHook):
+            def after_hooked_method(self, param):
+                try:
+                    plugin.tabs.remove(param.thisObject)
+                    plugin._show_dots(param.thisObject, False)
+                except Exception as e:
+                    _log("tab clear: %s" % e)
+
+        for cname in ("org.telegram.ui.Components.TopicsTabsView$HorizontalTabView",
+                      "org.telegram.ui.Components.TopicsTabsView$VerticalTabView"):
+            cls = find_class(cname)
+            if cls is None:
+                _log("missing " + cname)
+                continue
+            for m in cls.getDeclaredMethods():
+                n = m.getName()
+                if n == "set" and len(m.getParameterTypes()) == 3:
+                    self.hook_method(m, TabSetHook())
+                elif n in ("setAll", "setAdd"):
+                    self.hook_method(m, TabClearHook())
+        self.log("Topic Typing loaded")
+        _log("loaded " + __version__)
+
+    # ---- typing text -------------------------------------------------------
+
+    def _name(self, user):
+        try:
+            for v in (user.first_name, user.last_name):
+                if v is not None and len(str(v)) > 0:
+                    return str(AndroidUtilities.removeDiacritics(v))
+        except Exception:
+            pass
+        return ""
+
+    def _filter(self, mc, arr):
+        try:
+            neko = jclass("tw.nekomimi.nekogram.NekoConfig")
+            if not bool(neko.ignoreBlocked.Bool()):
+                return arr
+            blocked = get_private_field(mc, "blockePeers")
+            ayu = jclass("tw.nekomimi.nekogram.filters.AyuFilter")
+            out = []
+            for pu in arr:
+                uid = int(pu.userId)
+                if blocked is not None and blocked.indexOfKey(uid) >= 0:
+                    continue
+                if bool(ayu.isCustomFilteredPeer(uid)):
+                    continue
+                out.append(pu)
+            return out
+        except Exception:
+            return arr
+
+    def _text(self, mc, arr):
+        """Stock group wording for one topic's typing users. Returns (text, type) or None."""
+        if len(arr) == 1:
+            pu = arr[0]
+            user = mc.getUser(JLong(int(pu.userId)))
+            if user is None:
+                return None
+            name = self._name(user)
+            action = pu.action
+            for cls, key, typ in self.action_classes:
+                if action is not None and isinstance(action, cls):
+                    if key == "IsEnjoyngAnimations":
+                        return LocaleController.formatString(key, _res(key), name, str(action.emoticon)), typ
+                    return LocaleController.formatString(key, _res(key), name), typ
+            return LocaleController.formatString("IsTypingGroup", _res("IsTypingGroup"), name), 0
+        names = []
+        for pu in arr:
+            user = mc.getUser(JLong(int(pu.userId)))
+            if user is not None:
+                names.append(self._name(user))
+            if len(names) == 2:
+                break
+        if not names:
+            return None
+        label = ", ".join(names)
+        if len(names) == 1:
+            return LocaleController.formatString("IsTypingGroup", _res("IsTypingGroup"), label), 0
+        if len(arr) > 2:
+            plural = LocaleController.getPluralString("AndMoreTypingGroup", len(arr) - 2)
+            try:
+                return JString.format(plural, label, JInteger(len(arr) - 2)), 0
+            except Exception:
+                return "LOC_ERR: AndMoreTypingGroup", 0
+        return LocaleController.formatString("AreTypingGroup", _res("AreTypingGroup"), label), 0
+
+    def _polish(self, text):
+        try:
+            paint = Theme.dialogs_messageNamePaint
+            if paint is None:
+                paint = jclass("android.graphics.Paint")()
+                paint.setTypeface(AndroidUtilities.bold())
+                paint.setTextSize(float(dp(14)))
+            text = jclass("org.telegram.messenger.Emoji").replaceEmoji(text, paint.getFontMetricsInt(), False)
+        except Exception as e:
+            _log("emoji: %s" % e)
+        try:
+            text = jclass("tw.nekomimi.nekogram.helpers.MessageHelper").zalgoFilter(text)
+        except Exception as e:
+            _log("zalgo: %s" % e)
+        return text
+
+    def _after_printing(self, mc):
+        fixes = {}
+        live = {}
+        users = mc.printingUsers
+        for did in list(users.keySet().toArray()):
+            did = int(did)
+            if did >= 0:
+                continue
+            threads = users.get(JLong(did))
+            if threads is None:
+                continue
+            # which topics have someone typing right now; the tab dots read this, so
+            # they never depend on the order the app swaps its typing texts in
+            on = set()
+            for tid in list(threads.keySet().toArray()):
+                lst = threads.get(JInteger(int(tid)))  # the map is keyed by Integer
+                if lst is not None and self._filter(mc, list(lst.toArray())):
+                    on.add(int(tid))
+            if on:
+                live[did] = on
+            if threads.size() < 2:
+                continue  # one topic typing: stock text is already right
+            per = {}
+            for tid in list(threads.keySet().toArray()):
+                tid = int(tid)
+                lst = threads.get(JInteger(tid))
+                if lst is None:
+                    continue
+                arr = self._filter(mc, list(lst.toArray()))
+                if not arr:
+                    continue
+                res = self._text(mc, arr)
+                if res is None:
+                    continue
+                per[tid] = (self._polish(res[0]), res[1])
+            fixes[did] = per
+        account = int(get_private_field(mc, "currentAccount") or 0)
+
+        def apply():
+            self.live[account] = live
+            try:
+                strings = mc.printingStrings
+                types = mc.printingStringsTypes
+                for did, per in fixes.items():
+                    if not per:
+                        strings.remove(did)
+                        types.remove(did)
+                        continue
+                    s = LongSparseArray()
+                    t = LongSparseArray()
+                    for tid, (text, typ) in per.items():
+                        s.put(tid, text)
+                        t.put(tid, jint(typ))  # jint boxes to Integer; a plain int would become Long and crash getPrintingStringType
+                    strings.put(did, s)
+                    types.put(did, t)
+                if fixes:
+                    _log("topics typing: %s" % {d: sorted(p.keys()) for d, p in fixes.items()})
+                    # redraw the open topic's header from the fixed texts; the app's own
+                    # redraw can run before them and leave the header on one topic's text
+                    nc = jclass("org.telegram.messenger.NotificationCenter")
+                    mask = int(jclass("org.telegram.messenger.MessagesController").UPDATE_MASK_USER_PRINT)
+                    nc.getInstance(account).postNotificationName(nc.updateInterfaces, jarray(JObject)([JInteger(mask)]))
+            except Exception as e:
+                _log("apply: %s" % e)
+            self._refresh_tabs(account)
+
+        run_on_ui_thread(apply)
+
+    # ---- topic tabs ----------------------------------------------------------
+
+    def _after_tab_set(self, param):
+        view = param.thisObject
+        did = int(param.args[0])
+        topic = param.args[1]
+        account = int(get_private_field(view, "currentAccount") or 0)
+        self.tabs.put(view, "%d:%d:%d" % (account, did, int(topic.id)))
+        self._update_tab(view)
+
+    def _typing_in(self, account, did, tid):
+        on = self.live.get(account, {}).get(did, ())
+        if tid in on:
+            return True
+        # General topic (id 1): typing there arrives without a topic id
+        return tid == 1 and 0 in on
+
+    def _update_tab(self, view):
+        key = self.tabs.get(view)
+        show = False
+        if key is not None and bool(self.get_setting("tabs_dots", True)):
+            account, did, tid = [int(x) for x in str(key).split(":")]
+            show = self._typing_in(account, did, tid)
+        self._show_dots(view, show)
+
+    def _refresh_tabs(self, account):
+        try:
+            views = list(self.tabs.keySet().toArray())
+        except Exception:
+            return
+        for v in views:
+            try:
+                if v.isAttachedToWindow():
+                    self._update_tab(v)
+            except Exception as e:
+                _log("refresh tab: %s" % e)
+
+    def _show_dots(self, view, show):
+        key = int(view.hashCode())
+        dots = self.dots.get(key)
+        if dots is None:
+            if not show:
+                return
+            drawable = jclass("org.telegram.ui.Components.TypingDotsDrawable")(True)
+            drawable.setIsChat(False)
+            drawable.setColor(Theme.getColor(Theme.key_chats_actionMessage))
+            dots = View(view.getContext())
+            dots.setBackground(drawable)
+            horizontal = "Horizontal" in str(view.getClass().getName())
+            if horizontal:
+                # the tab lays its children out itself, so the dots sit at its top left
+                # corner and _center_dots moves them over the middle of the title
+                lp = FrameLayoutParams(dp(18), dp(13), Gravity.TOP | Gravity.LEFT)
+            else:
+                lp = FrameLayoutParams(dp(18), dp(13), Gravity.TOP | Gravity.RIGHT)
+                lp.topMargin = dp(2)
+                lp.rightMargin = dp(4)
+            view.addView(dots, lp)
+            self.dots[key] = dots
+        if dots.getParent() is None or dots.getParent() != view:
+            return
+        drawable = dots.getBackground()
+        if show:
+            if dots.getVisibility() != View.VISIBLE:
+                dots.setVisibility(View.VISIBLE)
+            self._center_dots(view, dots)
+            run_on_ui_thread(lambda v=view, d=dots: self._center_dots(v, d), 60)
+            if not drawable.isStarted():
+                drawable.start()
+            dots.invalidate()
+        else:
+            if dots.getVisibility() != View.GONE:
+                dots.setVisibility(View.GONE)
+            if drawable.isStarted():
+                drawable.stop()
+
+    def _center_dots(self, view, dots):
+        """Horizontal tabs: put the dots over the middle of the topic title."""
+        try:
+            if "Horizontal" not in str(view.getClass().getName()):
+                return
+            tv = get_private_field(view, "textView")
+            if tv is None or tv.getWidth() <= 0:
+                return
+            x = tv.getLeft() + (tv.getWidth() - dp(18)) / 2.0 - dots.getLeft()
+            dots.setTranslationX(float(x))
+        except Exception as e:
+            _log("center dots: %s" % e)
