@@ -1,4 +1,4 @@
-# 💬⌨️👀 Topic Typing
+# 💬⌨️👀 Topic Typing Indicator
 
 A plugin for Nagram XF. In a forum group, every topic shows its own typing indicator, even when people type in several topics at the same time. The topic tabs get animated typing dots too.
 
@@ -22,7 +22,7 @@ Setting: the tab dots can be switched off. The header fix is always on.
 1. Use the plugin build of Nagram XF and turn on the plugin engine (Settings, N Settings, Plugins).
 2. Download `topic_typing.plugin` from the latest release.
 3. Send it to your Saved Messages, tap it and choose install. You can also use the plus button on the Plugins screen.
-4. Make sure Topic Typing is switched on.
+4. Make sure Topic Typing Indicator is switched on.
 
 ## How it works
 
@@ -45,4 +45,4 @@ MIT
 
 ## Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=firestarter1996/xf-topic-typing&type=Date)](https://star-history.com/#firestarter1996/xf-topic-typing&Date)
+[![Star History Chart](https://api.star-history.com/svg?repos=firestarter1996/xf-topic-typing-indicator&type=Date)](https://star-history.com/#firestarter1996/xf-topic-typing-indicator&Date)
