@@ -1,8 +1,8 @@
 __id__ = "topic_typing"
-__name__ = "Topic Typing"
-__description__ = "In forum groups every topic shows its own typing indicator, in the topic tabs, the topic list and the topic itself, even when people type in several topics at once."
-__author__ = "Justice"
-__version__ = "1.0.0"
+__name__ = "Topic Typing Indicator"
+__description__ = "In forum groups every topic shows its own typing indicator, in the topic tabs, the topic list and the topic itself, even when people type in several topics at once. Made by [firestarter1996](https://github.com/firestarter1996)."
+__author__ = "firestarter1996"
+__version__ = "1.0.4"
 
 # Why stock only shows typing in one topic per group:
 #   MessagesController.updatePrintingStrings walks every group and, inside the
@@ -20,9 +20,19 @@ __version__ = "1.0.0"
 #   3. draws the typing dots on every topic tab (top tabs and side tabs) whose
 #      topic has someone typing. Stock tabs show no typing at all.
 # Private chats and groups with typing in one topic are left exactly as stock.
+#
+# Speed (1.0.1): the app calls updatePrintingStrings from its network timer, up to
+# about 200 times a second while it catches up after a launch. 1.0.0 rebuilt every
+# text in Python and posted work to the UI thread on every call, which froze the app
+# for seconds after a launch (ANR "No response to onStartJob"). Now a before hook
+# compares one hash of the typing list (a single Java call) and skips the rebuild,
+# stock's and ours, when nothing changed (a full rebuild still runs at least once a
+# second so late loaded names and action changes show). The UI thread gets work only
+# when the fixed texts or the topics with typing actually change.
 # Logcat tag: TopicTyping.
 
 import threading
+import time
 
 from java import jclass, jint, jarray
 from base_plugin import BasePlugin, MethodHook
@@ -46,6 +56,7 @@ View = jclass("android.view.View")
 FrameLayoutParams = jclass("android.widget.FrameLayout$LayoutParams")
 WeakHashMap = jclass("java.util.WeakHashMap")
 Collections = jclass("java.util.Collections")
+REFRESH_S = 1.0   # a full rebuild at least this often while someone types
 
 # Same order as the stock instanceof chain: (TL class, string key, type).
 _ACTIONS = [
@@ -80,7 +91,7 @@ class TopicTypingPlugin(BasePlugin):
 
     def create_settings(self):
         return [
-            Header(text="Topic Typing"),
+            Header(text="Topic Typing Indicator"),
             Switch(key="tabs_dots", text="Typing dots on topic tabs", default=True,
                    subtext="Shows animated dots on a topic tab while someone types in that topic."),
             Divider(text="The topic header and the topic list always show typing per topic."),
@@ -92,6 +103,25 @@ class TopicTypingPlugin(BasePlugin):
         self.dots = {}                                            # tab view hash -> dots view
         self.live = {}                                            # account -> {dialog: topics typing now}
         self.action_classes = []
+        self.state = {}      # controller hash -> {"h": typing list hash, "t": last rebuild, "acc": account}
+        self.applied = {}    # account -> signature of the texts last put on screen
+        self.posted_live = {}  # account -> live set last sent to the UI thread
+        try:
+            self.neko = jclass("tw.nekomimi.nekogram.NekoConfig")
+            self.ayu = jclass("tw.nekomimi.nekogram.filters.AyuFilter")
+        except Exception:
+            self.neko = None
+            self.ayu = None
+        try:
+            self.emoji = jclass("org.telegram.messenger.Emoji")
+        except Exception:
+            self.emoji = None
+        try:
+            self.zalgo = jclass("tw.nekomimi.nekogram.helpers.MessageHelper")
+        except Exception:
+            self.zalgo = None
+        self.nc_cls = jclass("org.telegram.messenger.NotificationCenter")
+        self.print_mask = int(jclass("org.telegram.messenger.MessagesController").UPDATE_MASK_USER_PRINT)
         for name, key, typ in _ACTIONS:
             try:
                 self.action_classes.append((jclass("org.telegram.tgnet.TLRPC$" + name), key, typ))
@@ -102,6 +132,12 @@ class TopicTypingPlugin(BasePlugin):
         plugin = self
 
         class PrintingHook(MethodHook):
+            def before_hooked_method(self, param):
+                try:
+                    plugin._before_printing(param)
+                except Exception as e:
+                    _log("before printing: %s" % e)
+
             def after_hooked_method(self, param):
                 try:
                     plugin._after_printing(param.thisObject)
@@ -137,8 +173,63 @@ class TopicTypingPlugin(BasePlugin):
                     self.hook_method(m, TabSetHook())
                 elif n in ("setAll", "setAdd"):
                     self.hook_method(m, TabClearHook())
-        self.log("Topic Typing loaded")
+        self._hook_dots_phase()
+        self.log("Topic Typing Indicator loaded")
         _log("loaded " + __version__)
+
+    # ---- staggered typing dots everywhere ----------------------------------
+    # Stock TypingDotsDrawable restarts each dot's cycle by dropping the time that ran
+    # past 800 ms. Two dots that reset in the same frame stay identical forever, so after
+    # a few minutes of typing the three dots pulse together (header, chat list, tabs).
+    # Once a second every running dots drawable gets its stock 150 ms per dot offsets back.
+    def _hook_dots_phase(self):
+        plugin = self
+        cls = find_class("org.telegram.ui.Components.TypingDotsDrawable")
+        if cls is None:
+            _log("missing TypingDotsDrawable")
+            return
+        self.dots_el = cls.getDeclaredField("elapsedTimes")
+        self.dots_el.setAccessible(True)
+        self.dots_st = cls.getDeclaredField("startTimes")
+        self.dots_st.setAccessible(True)
+        self.dots_all = Collections.synchronizedMap(WeakHashMap())
+        self.dots_timer = False
+
+        class DotsHook(MethodHook):
+            def after_hooked_method(self, param):
+                try:
+                    plugin.dots_all.put(param.thisObject, True)
+                    if not plugin.dots_timer:
+                        plugin.dots_timer = True
+                        run_on_ui_thread(plugin._realign_dots, 50)
+                except Exception as e:
+                    _log("dots hook: %s" % e)
+
+        for m in cls.getDeclaredMethods():
+            if m.getName() == "start" and len(m.getParameterTypes()) == 0:
+                self.hook_method(m, DotsHook())
+
+    def _realign_dots(self):
+        try:
+            drs = list(self.dots_all.keySet().toArray())[:64]
+            now = int(time.time() * 1000)
+            running = 0
+            for d in drs:
+                if d is None or not d.isStarted():
+                    continue
+                running += 1
+                el = self.dots_el.get(d)
+                st = self.dots_st.get(d)
+                for a in range(3):
+                    st[a] = 0.0
+                    el[a] = float((now - 150 * a) % 800)
+        except Exception as e:
+            _log("realign dots: %s" % e)
+            running = 0
+        if running:
+            run_on_ui_thread(self._realign_dots, 1000)
+        else:
+            self.dots_timer = False
 
     # ---- typing text -------------------------------------------------------
 
@@ -153,11 +244,10 @@ class TopicTypingPlugin(BasePlugin):
 
     def _filter(self, mc, arr):
         try:
-            neko = jclass("tw.nekomimi.nekogram.NekoConfig")
-            if not bool(neko.ignoreBlocked.Bool()):
+            neko, ayu = self.neko, self.ayu
+            if neko is None or not bool(neko.ignoreBlocked.Bool()):
                 return arr
             blocked = get_private_field(mc, "blockePeers")
-            ayu = jclass("tw.nekomimi.nekogram.filters.AyuFilter")
             out = []
             for pu in arr:
                 uid = int(pu.userId)
@@ -212,16 +302,42 @@ class TopicTypingPlugin(BasePlugin):
                 paint = jclass("android.graphics.Paint")()
                 paint.setTypeface(AndroidUtilities.bold())
                 paint.setTextSize(float(dp(14)))
-            text = jclass("org.telegram.messenger.Emoji").replaceEmoji(text, paint.getFontMetricsInt(), False)
+            text = self.emoji.replaceEmoji(text, paint.getFontMetricsInt(), False)
         except Exception as e:
             _log("emoji: %s" % e)
         try:
-            text = jclass("tw.nekomimi.nekogram.helpers.MessageHelper").zalgoFilter(text)
+            text = self.zalgo.zalgoFilter(text)
         except Exception as e:
             _log("zalgo: %s" % e)
         return text
 
+    def _before_printing(self, param):
+        """Skip the rebuild (stock's and ours) while the typing list has not changed."""
+        mc = param.thisObject
+        key = int(mc.hashCode())
+        st = self.state.get(key)
+        if st is None:
+            st = {"h": None, "t": 0.0, "acc": int(get_private_field(mc, "currentAccount") or 0), "ran": False}
+            self.state[key] = st
+        st["ran"] = True
+        try:
+            h = int(mc.printingUsers.hashCode())
+        except Exception:
+            st["h"] = None   # list changing under us: let the rebuild run
+            return
+        now = time.monotonic()
+        if h == st["h"] and now - st["t"] < REFRESH_S:
+            st["ran"] = False
+            param.setResult(None)
+            return
+        st["h"] = h
+        st["t"] = now
+        st["ran"] = True
+
     def _after_printing(self, mc):
+        st = self.state.get(int(mc.hashCode()))
+        if st is not None and not st["ran"]:
+            return
         fixes = {}
         live = {}
         users = mc.printingUsers
@@ -256,8 +372,15 @@ class TopicTypingPlugin(BasePlugin):
                 if res is None:
                     continue
                 per[tid] = (self._polish(res[0]), res[1])
-            fixes[did] = per
-        account = int(get_private_field(mc, "currentAccount") or 0)
+            if per:
+                # nothing fixable yet (names not loaded): leave stock's text alone
+                fixes[did] = per
+        account = st["acc"] if st is not None else int(get_private_field(mc, "currentAccount") or 0)
+        live_changed = self.posted_live.get(account) != live
+        if not fixes and not live_changed:
+            return   # stock's texts are right and the tab dots are current: no UI work
+        self.posted_live[account] = live
+        sig = repr(sorted((d, sorted((t, str(x[0]), x[1]) for t, x in p.items())) for d, p in fixes.items()))
 
         def apply():
             self.live[account] = live
@@ -265,10 +388,6 @@ class TopicTypingPlugin(BasePlugin):
                 strings = mc.printingStrings
                 types = mc.printingStringsTypes
                 for did, per in fixes.items():
-                    if not per:
-                        strings.remove(did)
-                        types.remove(did)
-                        continue
                     s = LongSparseArray()
                     t = LongSparseArray()
                     for tid, (text, typ) in per.items():
@@ -276,16 +395,19 @@ class TopicTypingPlugin(BasePlugin):
                         t.put(tid, jint(typ))  # jint boxes to Integer; a plain int would become Long and crash getPrintingStringType
                     strings.put(did, s)
                     types.put(did, t)
-                if fixes:
+                if fixes and self.applied.get(account) != sig:
+                    self.applied[account] = sig
                     _log("topics typing: %s" % {d: sorted(p.keys()) for d, p in fixes.items()})
                     # redraw the open topic's header from the fixed texts; the app's own
                     # redraw can run before them and leave the header on one topic's text
-                    nc = jclass("org.telegram.messenger.NotificationCenter")
-                    mask = int(jclass("org.telegram.messenger.MessagesController").UPDATE_MASK_USER_PRINT)
-                    nc.getInstance(account).postNotificationName(nc.updateInterfaces, jarray(JObject)([JInteger(mask)]))
+                    nc = self.nc_cls
+                    nc.getInstance(account).postNotificationName(nc.updateInterfaces, jarray(JObject)([JInteger(self.print_mask)]))
+                elif not fixes:
+                    self.applied.pop(account, None)
             except Exception as e:
                 _log("apply: %s" % e)
-            self._refresh_tabs(account)
+            if live_changed:
+                self._refresh_tabs(account)
 
         run_on_ui_thread(apply)
 
@@ -297,7 +419,7 @@ class TopicTypingPlugin(BasePlugin):
         topic = param.args[1]
         account = int(get_private_field(view, "currentAccount") or 0)
         self.tabs.put(view, "%d:%d:%d" % (account, did, int(topic.id)))
-        self._update_tab(view)
+        self._update_tab(view, recenter=True)
 
     def _typing_in(self, account, did, tid):
         on = self.live.get(account, {}).get(did, ())
@@ -306,13 +428,13 @@ class TopicTypingPlugin(BasePlugin):
         # General topic (id 1): typing there arrives without a topic id
         return tid == 1 and 0 in on
 
-    def _update_tab(self, view):
+    def _update_tab(self, view, recenter=False):
         key = self.tabs.get(view)
         show = False
         if key is not None and bool(self.get_setting("tabs_dots", True)):
             account, did, tid = [int(x) for x in str(key).split(":")]
             show = self._typing_in(account, did, tid)
-        self._show_dots(view, show)
+        self._show_dots(view, show, recenter)
 
     def _refresh_tabs(self, account):
         try:
@@ -326,7 +448,7 @@ class TopicTypingPlugin(BasePlugin):
             except Exception as e:
                 _log("refresh tab: %s" % e)
 
-    def _show_dots(self, view, show):
+    def _show_dots(self, view, show, recenter=False):
         key = int(view.hashCode())
         dots = self.dots.get(key)
         if dots is None:
@@ -352,13 +474,13 @@ class TopicTypingPlugin(BasePlugin):
             return
         drawable = dots.getBackground()
         if show:
-            if dots.getVisibility() != View.VISIBLE:
+            if dots.getVisibility() != View.VISIBLE or recenter:
                 dots.setVisibility(View.VISIBLE)
-            self._center_dots(view, dots)
-            run_on_ui_thread(lambda v=view, d=dots: self._center_dots(v, d), 60)
+                self._center_dots(view, dots)
+                # once more after the next layout pass, when the title has its width
+                run_on_ui_thread(lambda v=view, d=dots: self._center_dots(v, d), 60)
             if not drawable.isStarted():
                 drawable.start()
-            dots.invalidate()
         else:
             if dots.getVisibility() != View.GONE:
                 dots.setVisibility(View.GONE)
